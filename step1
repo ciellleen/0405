@@ -1,0 +1,245 @@
+#include <stdio.h>
+#include <string.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <termios.h>
+#include <unistd.h>
+#include <stdint.h>
+#include <pthread.h>
+
+class UART 
+{
+private:
+    int uart_fd;                    // 시리얼 포트 파일 디스크립터
+    pthread_t read_thread;          // 읽기 스레드
+    unsigned char read_buf[7];      // 읽기 버퍼
+    bool running;                   // 스레드 실행 상태
+    
+    const char* serial_device;      // 시리얼 장치 경로
+    speed_t baudrate;               // 통신 속도
+    
+    // CRC16 MODBUS 계산 메소드
+    static uint16_t CRC16_MODBUS(const unsigned char* data, int length) 
+    {
+        uint16_t crc = 0xFFFF;
+        
+        for(int i = 0; i < length; i++) 
+        {
+            crc ^= (uint16_t)data[i];
+            for(int j = 0; j < 8; j++) 
+            {
+                if (crc & 0x0001) 
+                {
+                    crc = (crc >> 1) ^ 0xA001;
+                } 
+                else 
+                {
+                    crc = crc >> 1;
+                }
+            }
+        }
+        return crc;
+    }
+    
+    // 읽기 스레드 정적 호출 함수
+    static void* readThreadWrapper(void* instance) 
+    {
+        return ((UART*)instance)->readThreadFunction();
+    }
+    
+    // 실제 읽기 스레드 함수
+    void* readThreadFunction() 
+    {
+        int num_bytes = -1;
+        unsigned char insert_buf;
+        printf("Thread started\n");
+        
+        while (running) 
+        {
+            while ((num_bytes = read(uart_fd, &insert_buf, 1)) > 0) 
+            {
+                printf("Data read: %d bytes, Insert byte: %02X\n", num_bytes, insert_buf);
+                
+                // 버퍼 업데이트
+                for (int i = 0; i < 6; i++) 
+                {
+                    read_buf[i] = read_buf[i + 1];
+                }
+                read_buf[6] = insert_buf;
+            }
+        }
+        return NULL;
+    }
+    
+public:
+    UART(const char* device = "/dev/ttyUSB0", speed_t baud = B115200) 
+        : uart_fd(-1), running(false), serial_device(device), baudrate(baud) 
+    {
+        memset(read_buf, 0, sizeof(read_buf));
+    }
+    
+    ~UART() 
+    {
+        close();
+    }
+    
+    bool init() 
+    {
+        uart_fd = open(serial_device, O_RDWR);
+        if (uart_fd < 0) 
+        {
+            printf("Error %i from open: %s\n", errno, strerror(errno));
+            return false;
+        }
+        
+        struct termios tty;
+        if (tcgetattr(uart_fd, &tty) != 0) 
+        {
+            printf("Error %i from tcgetattr: %s\n", errno, strerror(errno));
+            close();
+            return false;
+        }
+        
+        tty.c_cflag &= ~PARENB;       // 패리티 비트 없음
+        tty.c_cflag &= ~CSTOPB;       // 1 스탑 비트
+        tty.c_cflag &= ~CSIZE;        // 비트 마스크 클리어
+        tty.c_cflag |= CS8;           // 8 비트
+        tty.c_cflag &= ~CRTSCTS;      // 하드웨어 흐름 제어 없음
+        tty.c_cflag |= CREAD | CLOCAL; // 수신 가능 및 모뎀 상태 무시
+        
+        tty.c_lflag &= ~ICANON;       // 정규 모드 비활성화
+        tty.c_lflag &= ~ECHO;         // 에코 비활성화
+        tty.c_lflag &= ~ECHOE;        // 에러 문자 비활성화
+        tty.c_lflag &= ~ECHONL;       // 뉴라인 에코 비활성화
+        tty.c_lflag &= ~ISIG;         // 인터럽트 신호 비활성화
+        
+        tty.c_iflag &= ~(IXON | IXOFF | IXANY); // 소프트웨어 흐름 제어 비활성화
+        tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL); // 특수 문자 처리 비활성화
+        
+        tty.c_oflag &= ~OPOST;        // 출력 처리 비활성화
+        tty.c_oflag &= ~ONLCR;        // 개행 변환 비활성화
+        
+        tty.c_cc[VTIME] = 100;        // 10초 타임아웃
+        tty.c_cc[VMIN] = 0;           // 최소 읽기 바이트 없음
+        
+        cfsetispeed(&tty, baudrate);
+        cfsetospeed(&tty, baudrate);
+        
+        if (tcsetattr(uart_fd, TCSANOW, &tty) != 0) 
+        {
+            printf("Error %i from tcsetattr: %s\n", errno, strerror(errno));
+            close();
+            return false;
+        }
+        return true;
+    }
+    
+    bool startReadThread() 
+    {
+        if (uart_fd < 0) 
+        {
+            printf("Serial port not initialized\n");
+            return false;
+        }
+        
+        running = true;
+        if (pthread_create(&read_thread, NULL, readThreadWrapper, this) != 0) 
+        {
+            printf("Failed to create read thread\n");
+            running = false;
+            return false;
+        }
+        return true;
+    }
+    
+    int write(const unsigned char* data, int length) 
+    {
+        if (uart_fd < 0) 
+        {
+            return -1;
+        }
+        return ::write(uart_fd, data, length);
+    }
+
+    void close() 
+    {
+        if (running) 
+        {
+            running = false;
+            pthread_join(read_thread, NULL);
+        }
+        
+        if (uart_fd >= 0) 
+        {
+            ::close(uart_fd);
+            uart_fd = -1;
+        }
+    }
+    
+    const unsigned char* getReadBuffer() const 
+    {
+        return read_buf;
+    }
+    
+    int Send_Relay_Command(uint8_t controller_id, int relay_channel, bool turn_on, bool show_debug)
+    {
+        uint8_t cmd[8];
+        cmd[0] = controller_id;  
+        cmd[1] = 0x05;            
+        cmd[2] = 0x09;            
+        cmd[3] = 0x10 + relay_channel;        
+        cmd[4] = turn_on ? 0xFF : 0x00;  
+        cmd[5] = 0x00;            
+
+        uint16_t crc = CRC16_MODBUS(cmd, 6);
+        cmd[6] = crc & 0xFF;       
+        cmd[7] = (crc >> 8) & 0xFF; 
+
+        if (show_debug)
+        {
+            printf("Sending relay %s command to address 0x%02X: ", 
+                   turn_on ? "ON" : "OFF", 0x10 + relay_channel);
+            for (int i = 0; i < 8; i++) 
+            {
+                printf(" 0x%02X ", cmd[i]);
+            }
+            printf("\n");
+        }
+
+        int result = write(cmd, 8);
+        if (result != 8)
+        {
+            if (show_debug) printf("Failed to send relay command\n");
+            return -1;
+        }
+        return 0;
+    }
+};
+
+int main() 
+{
+    UART uart("/dev/ttyUSB0", B115200);
+
+    if (!uart.init()) 
+    {
+        printf("Failed to initialize UART\n");
+        return -1;
+    }
+
+    if (!uart.startReadThread()) 
+    {
+        printf("Failed to start read thread\n");
+        return -1;
+    }
+
+    printf("UART initialized and read thread started. Running main loop...\n");
+
+    uart.Send_Relay_Command(1, 0, true, true); 
+
+    while (1) 
+    {
+        usleep(10000); 
+    }
+
+    return 0;
+}
