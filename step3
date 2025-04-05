@@ -1,0 +1,351 @@
+#include <stdio.h>
+#include <string.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <termios.h>
+#include <unistd.h>
+#include <stdint.h>
+#include <pthread.h>
+#include <sys/time.h>
+
+class UART 
+{
+private:
+    int uart_fd;
+    pthread_t read_thread;
+    unsigned char read_buf[8];
+    int read_buf_index;
+    bool running;
+    
+    const char* serial_device;
+    speed_t baudrate;
+    
+    static uint16_t CRC16_MODBUS(const unsigned char* data, int length) 
+    {
+        uint16_t crc = 0xFFFF;
+        
+        for(int i = 0; i < length; i++) 
+        {
+            crc ^= (uint16_t)data[i];
+            for(int j = 0; j < 8; j++) 
+            {
+                if (crc & 0x0001) 
+                {
+                    crc = (crc >> 1) ^ 0xA001;
+                } 
+                else 
+                {
+                    crc = crc >> 1;
+                }
+            }
+        }
+        return crc;
+    }
+    
+    static void* readThreadWrapper(void* instance) 
+    {
+        return ((UART*)instance)->readThreadFunction();
+    }
+    
+    void* readThreadFunction() 
+    {
+        int num_bytes = -1;
+        unsigned char insert_buf;
+        printf("Thread started\n");
+        
+        while (running) 
+        {
+            while ((num_bytes = read(uart_fd, &insert_buf, 1)) > 0) 
+            {
+                printf("Data read: %d bytes, Insert byte: %02X\n", num_bytes, insert_buf);
+                
+                if (read_buf_index < 8) 
+                {
+                    read_buf[read_buf_index++] = insert_buf;
+                }
+            }
+        }
+        return NULL;
+    }
+    
+public:
+    UART(const char* device = "/dev/ttyUSB0", speed_t baud = B115200) 
+        : uart_fd(-1), running(false), serial_device(device), baudrate(baud), read_buf_index(0) 
+    {
+        memset(read_buf, 0, sizeof(read_buf));
+    }
+    
+    ~UART() 
+    {
+        close();
+    }
+    
+    bool init() 
+    {
+        uart_fd = open(serial_device, O_RDWR);
+        if (uart_fd < 0) 
+        {
+            printf("Error %i from open: %s\n", errno, strerror(errno));
+            return false;
+        }
+        
+        struct termios tty;
+        if (tcgetattr(uart_fd, &tty) != 0) 
+        {
+            printf("Error %i from tcgetattr: %s\n", errno, strerror(errno));
+            close();
+            return false;
+        }
+        
+        tty.c_cflag &= ~PARENB;
+        tty.c_cflag &= ~CSTOPB;
+        tty.c_cflag &= ~CSIZE;
+        tty.c_cflag |= CS8;
+        tty.c_cflag &= ~CRTSCTS;
+        tty.c_cflag |= CREAD | CLOCAL;
+        
+        tty.c_lflag &= ~ICANON;
+        tty.c_lflag &= ~ECHO;
+        tty.c_lflag &= ~ECHOE;
+        tty.c_lflag &= ~ECHONL;
+        tty.c_lflag &= ~ISIG;
+        
+        tty.c_iflag &= ~(IXON | IXOFF | IXANY);
+        tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL);
+        
+        tty.c_oflag &= ~OPOST;
+        tty.c_oflag &= ~ONLCR;
+        
+        tty.c_cc[VTIME] = 100;
+        tty.c_cc[VMIN] = 0;
+        
+        cfsetispeed(&tty, baudrate);
+        cfsetospeed(&tty, baudrate);
+        
+        if (tcsetattr(uart_fd, TCSANOW, &tty) != 0) 
+        {
+            printf("Error %i from tcsetattr: %s\n", errno, strerror(errno));
+            close();
+            return false;
+        }
+        return true;
+    }
+    
+    bool startReadThread() 
+    {
+        if (uart_fd < 0) 
+        {
+            printf("Serial port not initialized\n");
+            return false;
+        }
+        
+        running = true;
+        if (pthread_create(&read_thread, NULL, readThreadWrapper, this) != 0) 
+        {
+            printf("Failed to create read thread\n");
+            running = false;
+            return false;
+        }
+        return true;
+    }
+    
+    int write(const unsigned char* data, int length) 
+    {
+        if (uart_fd < 0) 
+        {
+            return -1;
+        }
+        return ::write(uart_fd, data, length);
+    }
+    
+    void close() 
+    {
+        if (running) 
+        {
+            running = false;
+            pthread_join(read_thread, NULL);
+        }
+        
+        if (uart_fd >= 0) 
+        {
+            ::close(uart_fd);
+            uart_fd = -1;
+        }
+    }
+    
+    const unsigned char* getReadBuffer() const 
+    {
+        return read_buf;
+    }
+    
+    void wait_for_milliseconds(long wait_ms) 
+    {
+        struct timeval start_time, current_time;
+        long elapsed_ms = 0;
+
+        gettimeofday(&start_time, NULL);
+        while (elapsed_ms < wait_ms) 
+        {
+            gettimeofday(¤t_time, NULL);
+            elapsed_ms = (current_time.tv_sec - start_time.tv_sec) * 1000 + 
+                         (current_time.tv_usec - start_time.tv_usec) / 1000;
+            usleep(1000); 
+        }
+    }
+    
+    int Send_Relay_Command(uint8_t controller_id, int relay_channel, bool turn_on, bool show_debug)
+    {
+        uint8_t cmd[8];
+        cmd[0] = controller_id;  
+        cmd[1] = 0x05;            
+        cmd[2] = 0x09;            
+        cmd[3] = 0x10 + relay_channel;        
+        cmd[4] = turn_on ? 0xFF : 0x00;  
+        cmd[5] = 0x00;            
+
+        uint16_t crc = CRC16_MODBUS(cmd, 6);
+        cmd[6] = crc & 0xFF;       
+        cmd[7] = (crc >> 8) & 0xFF; 
+
+        if (show_debug)
+        {
+            printf("Sending relay %s command to address 0x%02X: ", 
+                   turn_on ? "ON" : "OFF", 0x10 + relay_channel);
+            for (int i = 0; i < 8; i++) 
+            {
+                printf(" 0x%02X ", cmd[i]);
+            }
+            printf("\n");
+        }
+
+        memset(read_buf, 0, sizeof(read_buf));
+        read_buf_index = 0;
+
+        int result = write(cmd, 8);
+        if (result != 8)
+        {
+            if (show_debug) printf("Failed to send relay command\n");
+            return -1;
+        }
+
+        wait_for_milliseconds(100); 
+
+        if (show_debug)
+        {
+            printf("Received buffer after command: ");
+            for (int i = 0; i < 8; i++)
+            {
+                printf(" 0x%02X ", read_buf[i]);
+            }
+            printf("\n");
+
+            bool isEchoValid = true;
+            for (int i = 0; i < 8; i++)
+            {
+                if (read_buf[i] != cmd[i])
+                {
+                    isEchoValid = false;
+                    break;
+                }
+            }
+            printf("Response matches request: %s\n", isEchoValid ? "Yes" : "No");
+        }
+
+        return 0;
+    }
+
+    bool decode_receive_protocol_relay_onoff(uint8_t* data, uint8_t controller_id, uint8_t relay_channel, bool debug_print) 
+    {
+        const int UART_BUFFER_SIZE = 8;
+
+        if (debug_print) 
+        {
+            printf("Received buffer: ");
+            for (int i = 0; i < UART_BUFFER_SIZE; i++) 
+            {
+                printf(" 0x%02X ", data[i]);
+            }
+            printf("\n");
+        }
+
+        for (int i = UART_BUFFER_SIZE - 6; i >= 0; i--) 
+        {
+            if (debug_print) 
+            {
+                printf("Checking at index %d: 0x%02X 0x%02X 0x%02X\n", 
+                       i, data[i + 0], data[i + 1], data[i + 2]);
+            }
+
+            if (data[i + 0] == controller_id && 
+                data[i + 1] == 0x05 && 
+                data[i + 3] == (0x10 + relay_channel)) 
+            {
+                uint16_t received_crc = data[i + 6] | (data[i + 7] << 8);
+                uint16_t calculated_crc = CRC16_MODBUS(&data[i], 6);
+
+                if (received_crc == calculated_crc) 
+                {
+                    if (debug_print) 
+                    {
+                        printf("수신 성공 - CRC 일치\n");
+                    }
+                    memset(read_buf, 0, sizeof(read_buf));
+                    read_buf_index = 0;
+                    return true;
+                } 
+                else 
+                {
+                    if (debug_print) 
+                    {
+                        printf("CRC 불일치 - Received: 0x%04X, Calculated: 0x%04X\n", 
+                               received_crc, calculated_crc);
+                    }
+                }
+            }
+        }
+
+        if (debug_print) 
+        {
+            printf("수신 실패 - 유효한 프로토콜 또는 CRC 없음\n");
+        }
+        return false;
+    }
+};
+
+int main() 
+{
+    UART uart("/dev/ttyUSB0", B115200);
+
+    if (!uart.init()) 
+    {
+        printf("Failed to initialize UART\n");
+        return -1;
+    }
+
+    if (!uart.startReadThread()) 
+    {
+        printf("Failed to start read thread\n");
+        return -1;
+    }
+
+    printf("UART initialized and read thread started. Running main loop...\n");
+
+    uart.Send_Relay_Command(1, 0, true, true);
+    uart.wait_for_milliseconds(200);
+    const unsigned char* buffer = uart.getReadBuffer();
+    if (uart.decode_receive_protocol_relay_onoff((uint8_t*)buffer, 1, 0, true)) 
+    {
+        printf("Relay command successfully verified!\n");
+    } 
+    else 
+    {
+        printf("Failed to verify relay command response.\n");
+    }
+
+    while (1) 
+    {
+        usleep(10000); 
+    }
+
+    return 0;
+}
